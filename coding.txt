@@ -1,0 +1,898 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <ArduinoJson.h>
+#include "HX711.h"
+#include <Adafruit_NeoPixel.h>
+
+// ================== 1. WiFi 配置 ==================
+const char* WIFI_SSID     = "XXXXxx";    
+const char* WIFI_PASSWORD = "63210699";  
+// ================== 2. MQTT 配置 ==================
+const char *mqtt_broker   = "mixio.mixly.cn";
+const char *mqtt_username = "516300807@qq.com";
+const char *mqtt_password = "0703b4abd1bc381f910a6b89d4f235d3";
+const int   mqtt_port     = 1883;
+String project            = "test";
+
+// ================== 3. DeepSeek 配置 ==================
+const char* DEEPSEEK_API_KEY = "sk-8d6d25dffc3a46f18eee5555baba8788";
+const char* DEEPSEEK_HOST    = "api.deepseek.com";
+const int   DEEPSEEK_PORT    = 443;
+const char* DEEPSEEK_MODEL   = "deepseek-chat";
+
+// ================== 4. 热敏打印机硬件引脚 ==================
+#define PIN_STB1   1
+#define PIN_STB2   2
+#define PIN_STB3   3
+#define PIN_STB4   4
+#define PIN_STB5   5
+#define PIN_STB6   6
+
+#define PIN_CLK    14
+#define PIN_MOSI   15
+#define PIN_LAT    13
+#define PIN_VHCTL  16   // 高压开关
+
+uint8_t stb_pins[] = {
+  PIN_STB1, PIN_STB2, PIN_STB3,
+  PIN_STB4, PIN_STB5, PIN_STB6
+};
+
+const int HEAD_DOTS  = 384;
+const int HEAD_BYTES = 48;
+
+const int HEAT_TIME_US   = 3000;
+const int COOL_TIME_US   = 20;
+const int MOTOR_DELAY_US = 1500;
+const int FEED_PER_ROW   = 2;
+
+// 步进电机
+#define PIN_MOTOR_AP 9
+#define PIN_MOTOR_AM 10
+#define PIN_MOTOR_BP 11
+#define PIN_MOTOR_BM 12
+
+uint8_t MOTOR_TABLE[8][4] = {
+  {1,0,0,1},
+  {0,0,0,1},
+  {0,0,1,1},
+  {0,0,1,0},
+  {0,1,1,0},
+  {0,1,0,0},
+  {1,1,0,0},
+  {1,0,0,0},
+};
+
+uint8_t motor_pos = 0;
+
+// 按键（可选）
+#define PIN_KEY   0
+bool key_last = true;
+
+// ================== 5. MQTT / DeepSeek 相关 ==================
+WiFiClient       espClient;
+PubSubClient     client(espClient);
+WiFiClientSecure secureClient;
+
+String sg;          // 身高（通过 MQTT 输入）
+String mqtt_topic;
+String mqtt_data;
+bool   mqtt_status = false;
+
+String topic_keyboard1;  // 身高输入
+String topic_text;       // 文本/旋律显示
+
+// 体重数字 → 主旋律提示音
+const char* noteMap[10] = {
+  "REST", "C4","D4","E4","F4","G4","A4","B4","C5","D5"
+};
+
+// ================== 6. HX711 （体重） ==================
+#define LOADCELL_DOUT_PIN 47
+#define LOADCELL_SCK_PIN  48
+#define CALIBRATION_FACTOR 20742.0f  
+
+HX711 scale;
+bool  scale_ok = false;
+
+// 当前体重（给灯环用），默认 60kg
+float g_currentWeightKg = 60.0f;
+
+// 本“三圈循环”是否已经锁定过体重（控制灯速）
+bool g_waveWeightLocked = false;
+
+// ================== 7. WS2812 三圈灯环 ==================
+#define NUM_LEDS        150   
+#define PIN_RING_INNER  42     // 最内圈
+#define PIN_RING_MIDDLE 41     // 中间圈
+#define PIN_RING_OUTER  40     // 最外圈
+
+Adafruit_NeoPixel ringInner(NUM_LEDS, PIN_RING_INNER, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel ringMiddle(NUM_LEDS, PIN_RING_MIDDLE, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel ringOuter(NUM_LEDS, PIN_RING_OUTER, NEO_GRB + NEO_KHZ800);
+
+// 水波纹动画状态（线性渐变）
+int wavePhase = 0;             // 0=内圈,1=中圈,2=外圈
+int waveDirection = 0;         // 0=变亮, 1=变暗
+unsigned long wavePhaseStartMs = 0;  // 当前这段亮/暗开始的时间戳
+
+// 从体重映射到一次“亮到最亮”或“暗到全暗”的时间(ms)
+// 40kg -> 2000ms（慢）  80kg -> 500ms（快）
+int getFadeDurationMs() {
+  float w = g_currentWeightKg;
+  if (w < 40.0f) w = 40.0f;
+  if (w > 80.0f) w = 80.0f;
+  float t = (w - 40.0f) / 40.0f;   // 0~1
+  float slow = 2000.0f;
+  float fast = 100.0f;
+  float v = slow - t * (slow - fast);
+  return (int)v;
+}
+
+// 在一轮三圈循环的开始，只调用一次，锁定本轮使用的体重
+void lockWeightForWave() {
+  if (!scale_ok) return;
+  if (!scale.is_ready()) return;
+
+  float w = scale.get_units(5);   // 读 5 次平均
+  if (w > 5.0f && w < 200.0f) {   // 合理范围
+    g_currentWeightKg = w;
+    Serial.printf("[灯效] 锁定本轮体重: %.2f kg\n", g_currentWeightKg);
+  } else {
+    Serial.println("[灯效] 体重不在合理范围，保持上次的速度");
+  }
+}
+
+// 不带 show() 的版本：只改缓冲区
+void clearRing(Adafruit_NeoPixel &ring) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    ring.setPixelColor(i, 0, 0, 0);
+  }
+}
+
+void setRingBlue(Adafruit_NeoPixel &ring, uint8_t brightness) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    ring.setPixelColor(i, 0, 0, brightness);
+  }
+}
+
+// 线性渐亮 / 渐暗水波纹：内圈 -> 中圈 -> 外圈
+// 一整轮（内→中→外）只在开始时读一次体重控制速度
+void updateWaterRipple() {
+  unsigned long now = millis();
+
+  // 一轮开始时锁定体重：
+  // 约定：当 wavePhase=0 且 waveDirection=0 时，表示新的一轮从“内圈变亮”开始
+  if (!g_waveWeightLocked && wavePhase == 0 && waveDirection == 0) {
+    lockWeightForWave();       // 本轮第一次进来时读一次体重
+    g_waveWeightLocked = true; // 标记：本轮已读
+  }
+
+  int fadeDuration = getFadeDurationMs();   // 这次从最暗到最亮(或反过来)需要多久
+  if (fadeDuration <= 0) fadeDuration = 1;
+
+  // 计算当前这段(亮或暗)已经走了多少比例 0.0 ~ 1.0
+  float t = (now - wavePhaseStartMs) / (float)fadeDuration;
+  if (t > 1.0f) t = 1.0f;
+  if (t < 0.0f) t = 0.0f;
+
+  // 根据方向算亮度：方向0 = 变亮，方向1 = 变暗
+  float level01 = (waveDirection == 0) ? t : (1.0f - t);
+  if (level01 < 0) level01 = 0;
+  if (level01 > 1) level01 = 1;
+  uint8_t brightness = (uint8_t)(level01 * 255.0f + 0.5f);
+
+  // 先全灭（只改缓冲区，不立即 show）
+  clearRing(ringInner);
+  clearRing(ringMiddle);
+  clearRing(ringOuter);
+
+  // 只点亮当前这一圈
+  if (wavePhase == 0) {
+    setRingBlue(ringInner, brightness);
+  } else if (wavePhase == 1) {
+    setRingBlue(ringMiddle, brightness);
+  } else {
+    setRingBlue(ringOuter, brightness);
+  }
+
+  // 统一刷新一次，避免“黑帧 + 亮帧”交替导致屏闪
+  ringInner.show();
+  ringMiddle.show();
+  ringOuter.show();
+
+  // 一个阶段结束（亮→最亮 或 暗→全暗）
+  if (now - wavePhaseStartMs >= (unsigned long)fadeDuration) {
+    wavePhaseStartMs = now;    // 重置起始时间
+
+    if (waveDirection == 0) {
+      // 刚刚完成“变亮”，接下来变暗
+      waveDirection = 1;
+    } else {
+      // 刚刚完成“变暗”，切换到下一圈，从变亮开始
+      waveDirection = 0;
+
+      int oldPhase = wavePhase;
+      wavePhase = (wavePhase + 1) % 3;  // 0->1->2->0
+
+      // 如果刚刚是外圈(2)变暗结束，然后切回内圈(0)，
+      // 说明一整轮「内->中->外」已经完成。
+      if (oldPhase == 2 && wavePhase == 0) {
+        // 允许下一轮重新读体重
+        g_waveWeightLocked = false;
+        Serial.println("[灯效] 三圈循环结束，下一轮将重新读取体重");
+      }
+    }
+  }
+}
+
+// ================== 8. 15 列音标参数（热敏打印用） ==================
+const int PITCH_COLS     = 15;
+const int TIME_MAX_ROWS  = 64;     // 最多 64 个时间步（大约 20 多个音）
+
+const int CELL_W         = 24;     // 15*24=360
+const int CELL_H         = 40;
+
+const int PRN_WIDTH      = HEAD_DOTS;
+const int BYTES_PER_LINE = HEAD_BYTES;
+
+// 15 个音名，对应 15 列，从左到右（高到低）
+const char* PITCH_NAMES[PITCH_COLS] = {
+  "D5","C5","B4","A4","G4","F4","E4",
+  "D4","C4","B3","A3","G3","F3","E3","D3"
+};
+
+uint8_t melodyGrid[TIME_MAX_ROWS][PITCH_COLS];
+
+// ================== 步进电机 ==================
+void motor_init(){
+  pinMode(PIN_MOTOR_AP, OUTPUT);
+  pinMode(PIN_MOTOR_AM, OUTPUT);
+  pinMode(PIN_MOTOR_BP, OUTPUT);
+  pinMode(PIN_MOTOR_BM, OUTPUT);
+
+  digitalWrite(PIN_MOTOR_AP, LOW);
+  digitalWrite(PIN_MOTOR_AM, LOW);
+  digitalWrite(PIN_MOTOR_BP, LOW);
+  digitalWrite(PIN_MOTOR_BM, LOW);
+}
+
+void motor_step(int dir){
+  digitalWrite(PIN_MOTOR_AP, MOTOR_TABLE[motor_pos][0]);
+  digitalWrite(PIN_MOTOR_BP, MOTOR_TABLE[motor_pos][1]);
+  digitalWrite(PIN_MOTOR_AM, MOTOR_TABLE[motor_pos][2]);
+  digitalWrite(PIN_MOTOR_BM, MOTOR_TABLE[motor_pos][3]);
+
+  if (dir > 0) motor_pos = (motor_pos + 1) % 8;
+  else         motor_pos = (motor_pos + 7) % 8;
+
+  delayMicroseconds(MOTOR_DELAY_US);
+}
+
+void motor_steps(int steps, int dir){
+  for(int i=0;i<steps;i++) motor_step(dir);
+}
+
+void motor_stop(){
+  digitalWrite(PIN_MOTOR_AP, LOW);
+  digitalWrite(PIN_MOTOR_AM, LOW);
+  digitalWrite(PIN_MOTOR_BP, LOW);
+  digitalWrite(PIN_MOTOR_BM, LOW);
+}
+
+// ================== 打印头底层 ==================
+void printer_init(){
+  SPI.begin(PIN_CLK, -1, PIN_MOSI, -1);
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+
+  pinMode(PIN_LAT,   OUTPUT);
+  pinMode(PIN_VHCTL, OUTPUT);
+  digitalWrite(PIN_LAT,   HIGH);
+  digitalWrite(PIN_VHCTL, LOW);
+
+  for(int i=0;i<6;i++){
+    pinMode(stb_pins[i], OUTPUT);
+    digitalWrite(stb_pins[i], LOW);
+  }
+}
+
+void printer_line(uint8_t *buf){
+  for(int i=0;i<HEAD_BYTES;i++){
+    SPI.transfer(buf[i]);
+  }
+  digitalWrite(PIN_LAT, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_LAT, HIGH);
+
+  for(int i=0;i<6;i++){
+    digitalWrite(stb_pins[i], HIGH);
+    delayMicroseconds(HEAT_TIME_US);
+    digitalWrite(stb_pins[i], LOW);
+    delayMicroseconds(COOL_TIME_US);
+  }
+}
+
+void printerSendDotLine(uint8_t *buf){
+  printer_line(buf);
+  motor_steps(FEED_PER_ROW, -1);
+}
+
+void printerFeed(int lines){
+  for(int i=0;i<lines;i++){
+    motor_steps(FEED_PER_ROW, -1);
+  }
+}
+
+// ================== MQTT 回调 ==================
+void callback(char *topic, byte *payload, unsigned int length) {
+  String data;
+  for (unsigned int i = 0; i < length; i++) {
+    data += (char)payload[i];
+  }
+  mqtt_topic  = String(topic);
+  mqtt_data   = data;
+  mqtt_status = true;
+}
+
+// ================== 通用工具 ==================
+bool extractJsonFromBody(const String& rawBody, String &jsonOut) {
+  int start = rawBody.indexOf('{');
+  int end   = rawBody.lastIndexOf('}');
+  if (start < 0 || end < 0 || end <= start) return false;
+  jsonOut = rawBody.substring(start, end + 1);
+  return true;
+}
+
+void setPixelBlack(uint8_t *line, int x) {
+  if (x < 0 || x >= PRN_WIDTH) return;
+  int byteIndex = x / 8;
+  int bitIndex  = 7 - (x % 8);
+  line[byteIndex] |= (1 << bitIndex);
+}
+
+void setPixelBlackWide(uint8_t *line, int x) {
+  setPixelBlack(line, x);
+  setPixelBlack(line, x + 1);
+}
+
+// ================== WiFi / MQTT 连接 ==================
+void connectWiFi() {
+  Serial.print("连接 WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi 已连接");
+  Serial.print("IP 地址: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMQTT() {
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(callback);
+
+  while (!client.connected()) {
+    String client_id = "esp-client-";
+    client_id += String(WiFi.macAddress());
+    Serial.print("连接 MQTT, client_id = ");
+    Serial.println(client_id);
+
+    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
+      Serial.println("MQTT 已连接");
+      String onlineTopic = String(mqtt_username) + "/" + project + "/" + "b640a0ce465fa2a4150c36b305c1c11b";
+      client.publish(onlineTopic.c_str(), client_id.c_str());
+    } else {
+      Serial.print("连接失败, state = ");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+
+  client.subscribe(topic_keyboard1.c_str());
+}
+
+// ================== DeepSeek 调用 ==================
+String callDeepSeekChat(const String& prompt) {
+  Serial.println("开始调用 DeepSeek ...");
+
+  if (!secureClient.connect(DEEPSEEK_HOST, DEEPSEEK_PORT)) {
+    Serial.println("连接 DeepSeek 服务器失败");
+    return "【错误】无法连接 DeepSeek 服务器";
+  }
+
+  StaticJsonDocument<4096> doc;
+  doc["model"] = DEEPSEEK_MODEL;
+  JsonArray messages = doc.createNestedArray("messages");
+
+  JsonObject sys = messages.createNestedObject();
+  sys["role"] = "system";
+  sys["content"] =
+    "你是一个作曲助手，根据用户的身高、体重、BMI 和主旋律音符，"
+    "为他生成一小段旋律。"
+    "你的输出必须是【机器可读的音符序列】，不要解释。"
+    "输出格式：只输出一行文本，用空格分隔若干个『音名/时值』。"
+    "音名只能从 {C4,D4,E4,F4,G4,A4,B4,C5,D5,REST} 中选择，其中 REST 表示休止。"
+    "时值使用 1,2,4,8 表示全音符、二分音符、四分音符、八分音符。"
+    "例如：C4/4 D4/4 E4/2 REST/4。"
+    "请尽量生成 18~24 个音符，让旋律稍微长一点。"
+    "禁止输出任何中文说明、情绪描述或多余字符，只能输出这一行音符序列。";
+
+  JsonObject user = messages.createNestedObject();
+  user["role"]    = "user";
+  user["content"] = prompt;
+
+  doc["stream"] = false;
+
+  String body;
+  serializeJson(doc, body);
+
+  String req;
+  req  = "POST /chat/completions HTTP/1.1\r\n";
+  req += "Host: " + String(DEEPSEEK_HOST) + "\r\n";
+  req += "Content-Type: application/json\r\n";
+  req += "Authorization: Bearer " + String(DEEPSEEK_API_KEY) + "\r\n";
+  req += "Content-Length: " + String(body.length()) + "\r\n";
+  req += "Connection: close\r\n\r\n";
+  req += body;
+
+  secureClient.print(req);
+
+  String response;
+  while (secureClient.connected() || secureClient.available()) {
+    if (secureClient.available()) {
+      String line = secureClient.readStringUntil('\n');
+      response += line + "\n";
+    }
+  }
+  secureClient.stop();
+
+  int bodyIndex = response.indexOf("\r\n\r\n");
+  if (bodyIndex < 0) {
+    Serial.println("DeepSeek 响应中未找到 HTTP body");
+    return "【错误】解析 DeepSeek 响应失败";
+  }
+  String respBody = response.substring(bodyIndex + 4);
+
+  String jsonStr;
+  if (!extractJsonFromBody(respBody, jsonStr)) {
+    Serial.println("从 DeepSeek body 中提取 JSON 失败");
+    return "【错误】DeepSeek 返回格式异常";
+  }
+
+  StaticJsonDocument<8192> docResp;
+  DeserializationError err = deserializeJson(docResp, jsonStr);
+  if (err) {
+    Serial.print("解析 DeepSeek JSON 失败: ");
+    Serial.println(err.c_str());
+    return "【错误】解析 DeepSeek 返回失败";
+  }
+
+  const char* content = docResp["choices"][0]["message"]["content"];
+  if (!content) {
+    Serial.println("DeepSeek 返回中没有 choices[0].message.content");
+    return "【错误】DeepSeek 没有返回内容";
+  }
+
+  return String(content);
+}
+
+// ================== 网格 & 15 列音标 ==================
+String extractNoteName(const String &token) {
+  int slashPos = token.indexOf('/');
+  if (slashPos <= 0) return token;
+  return token.substring(0, slashPos);
+}
+
+int noteToCol(const String &noteName) {
+  for (int i = 0; i < PITCH_COLS; i++) {
+    if (noteName.equalsIgnoreCase(PITCH_NAMES[i])) return i;
+  }
+  return -1;
+}
+
+// 小字体：5x7
+const int CHAR_W = 5;
+const int CHAR_H = 7;
+
+// 画一个字符
+void drawCharAt(int charX, int charTopY, char ch, int y, uint8_t *line) {
+  int relY = y - charTopY;
+  if (relY < 0 || relY >= CHAR_H) return;
+
+  switch (ch) {
+    case 'C':
+      if (relY == 0 || relY == CHAR_H - 1) {
+        for (int dx = 1; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else setPixelBlackWide(line, charX);
+      break;
+    case 'D':
+      if (relY == 0 || relY == CHAR_H - 1) {
+        for (int dx = 0; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else {
+        setPixelBlackWide(line, charX);
+        setPixelBlackWide(line, charX + CHAR_W - 2);
+      }
+      break;
+    case 'E':
+      if (relY == 0 || relY == CHAR_H - 1 || relY == CHAR_H / 2) {
+        for (int dx = 0; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else setPixelBlackWide(line, charX);
+      break;
+    case 'F':
+      if (relY == 0 || relY == CHAR_H / 2) {
+        for (int dx = 0; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else setPixelBlackWide(line, charX);
+      break;
+    case 'G':
+      if (relY == 0 || relY == CHAR_H - 1) {
+        for (int dx = 1; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else if (relY < CHAR_H - 2) setPixelBlackWide(line, charX);
+      else setPixelBlackWide(line, charX + CHAR_W - 2);
+      break;
+    case 'A':
+      if (relY == 0 || relY == CHAR_H / 2) {
+        for (int dx = 1; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else {
+        setPixelBlackWide(line, charX);
+        setPixelBlackWide(line, charX + CHAR_W - 1);
+      }
+      break;
+    case 'B':
+      if (relY == 0 || relY == CHAR_H / 2 || relY == CHAR_H - 1) {
+        for (int dx = 0; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else {
+        setPixelBlackWide(line, charX);
+        setPixelBlackWide(line, charX + CHAR_W - 2);
+      }
+      break;
+    case '2':
+    case '3':
+    case '4':
+    case '5':
+      if (relY == 0 || relY == CHAR_H / 2 || relY == CHAR_H - 1) {
+        for (int dx = 0; dx < CHAR_W - 1; dx++) setPixelBlackWide(line, charX + dx);
+      } else setPixelBlackWide(line, charX + CHAR_W - 2);
+      break;
+    default:
+      break;
+  }
+}
+
+// 顶部一行 15 音标，对齐 15 列竖线
+void printHeaderText() {
+  uint8_t line[BYTES_PER_LINE];
+
+  int headerHeight = CHAR_H + 4;
+  int imgWidth     = PITCH_COLS * CELL_W;      // 15 列
+  int offsetX      = (PRN_WIDTH - imgWidth)/2; // 居中
+
+  for (int y = 0; y < headerHeight; y++) {
+    memset(line, 0, BYTES_PER_LINE);
+
+    for (int c = 0; c < PITCH_COLS; c++) {
+      const char* nm = PITCH_NAMES[c]; // "D5"
+      char n1 = nm[0];
+      char n2 = nm[1];
+
+      int centerX   = offsetX + c * CELL_W + CELL_W / 2;
+      int totalW    = 2 * CHAR_W + 2;  // 两个字符+间隔
+      int leftX     = centerX - totalW / 2;
+
+      drawCharAt(leftX,              2, n1, y, line);
+      drawCharAt(leftX + CHAR_W + 2, 2, n2, y, line);
+    }
+
+    // 重复 3 次让字更高、更黑
+    printerSendDotLine(line);
+    printerSendDotLine(line);
+    printerSendDotLine(line);
+  }
+
+  printerFeed(1);
+}
+
+// 把 AI 返回的一行旋律串解析到 melodyGrid
+int buildMelodyGrid(const String &melodySeqRaw) {
+  for (int r = 0; r < TIME_MAX_ROWS; r++) {
+    for (int c = 0; c < PITCH_COLS; c++) {
+      melodyGrid[r][c] = 0;
+    }
+  }
+
+  String melodySeq = melodySeqRaw;
+  melodySeq.replace('\n', ' ');
+  melodySeq.replace('\r', ' ');
+
+  int row = 0;
+  int start = 0;
+  while (start < melodySeq.length() && row < TIME_MAX_ROWS) {
+    int spacePos = melodySeq.indexOf(' ', start);
+    if (spacePos < 0) spacePos = melodySeq.length();
+    String token = melodySeq.substring(start, spacePos);
+    token.trim();
+    if (token.length() > 0) {
+      String note = extractNoteName(token);
+      int col = noteToCol(note);
+      if (col >= 0 && col < PITCH_COLS) {
+        melodyGrid[row][col] = 1;
+        row++;
+      } else {
+        // REST 或不认识的音：只占时间，不画点
+        row++;
+      }
+    }
+    start = spacePos + 1;
+  }
+  return row; // 总共使用了多少行时间
+}
+
+// 打印整张 15 列网格 + 大圆点
+void printMelodyGrid(int totalRows) {
+  if (totalRows <= 0) return;
+
+  int imgWidth  = PITCH_COLS * CELL_W;
+  int imgHeight = totalRows * CELL_H;
+
+  int offsetX = (PRN_WIDTH - imgWidth) / 2;
+  if (offsetX < 0) offsetX = 0;
+
+  uint8_t line[BYTES_PER_LINE];
+
+  // 黑点半径：10 像素（大号）
+  const int DOT_R = 10;
+
+  for (int y = 0; y < imgHeight; y++) {
+    memset(line, 0, BYTES_PER_LINE);
+
+    int gridRow = y / CELL_H;    // 时间行
+    int yInCell = y % CELL_H;
+
+    for (int x = 0; x < imgWidth; x++) {
+      int globalX  = offsetX + x;
+      int pitchCol = x / CELL_W; // 第几列音高
+      int xInCell  = x % CELL_W;
+
+      bool black = false;
+
+      // 网格线：横线 + 竖线
+      if (yInCell == 0 || y == imgHeight - 1) black = true;
+      if (xInCell == 0 || x == imgWidth  - 1) black = true;
+
+      // 大圆点：在每个格子内部靠左上，但完全在格子里
+      if (gridRow >= 0 && gridRow < totalRows &&
+          pitchCol >= 0 && pitchCol < PITCH_COLS &&
+          melodyGrid[gridRow][pitchCol]) {
+
+        // 圆心往右下偏 DOT_R+1 像素，避免半圆
+        int centerX = offsetX + pitchCol * CELL_W + DOT_R + 1;
+        int centerY = gridRow  * CELL_H      + DOT_R + 1;
+
+        int dx = globalX - centerX;
+        int dy = y        - centerY;
+        if (dx*dx + dy*dy <= DOT_R * DOT_R) {
+          black = true;
+        }
+      }
+
+      if (black) setPixelBlack(line, globalX);
+    }
+
+    printerSendDotLine(line);
+  }
+
+  printerFeed(4);
+}
+
+// 从旋律串 → 打印 15 音标纸
+void printMelodyFromString(const String &melodySeq) {
+  int rows = buildMelodyGrid(melodySeq); // 大约 20 行
+  printHeaderText();                     // 顶部 15 音标
+  printMelodyGrid(rows);                 // 网格 + 大圆点
+}
+
+// ================== 身高(MQTT) + 体重(HX711) → AI → 打印 ==================
+void maybeCallAI() {
+  if (sg.length() == 0) {
+    Serial.println("还没有身高数据，先在网页上输入身高 (m)！");
+    return;
+  }
+
+  if (!scale_ok) {
+    Serial.println("HX711 未就绪，无法读取体重");
+    return;
+  }
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 当前未就绪，稍后再试");
+    return;
+  }
+
+  // 读取体重
+  float weight_kg = scale.get_units(10);
+  Serial.printf("当前称重结果: %.2f kg\n", weight_kg);
+
+  if (weight_kg <= 5.0f) {  // 小于 5kg 认为没人站上去
+    Serial.println("当前重量太小，可能没人站上秤，取消本次作曲");
+    return;
+  }
+
+  // 更新给灯环用的体重
+  g_currentWeightKg = weight_kg;
+
+  float height = sg.toFloat();
+  if (height <= 0) {
+    Serial.println("身高格式不合法，跳过 AI 调用");
+    return;
+  }
+
+  float  bmi          = weight_kg / (height * height);
+  String bmi_label_cn;
+  String style_text;
+
+  if (bmi < 18.5f) {
+    bmi_label_cn = "偏轻";
+    style_text   = "轻盈、灵动、欢快";
+  } else if (bmi < 24.0f) {
+    bmi_label_cn = "正常";
+    style_text   = "平衡、流畅、抒情";
+  } else {
+    bmi_label_cn = "偏重";
+    style_text   = "深沉、厚重、力量感";
+  }
+
+  // 体重数值 → 字符串，用来按数字映射主旋律
+  String wstr = String(weight_kg, 1); // 比如 52.3
+  String weightStr = String(weight_kg, 2);
+
+  wstr.replace(".", "");
+  wstr.replace(" ", "");
+
+  String melodyNotes;
+  for (int i = 0; i < wstr.length(); i++) {
+    char ch = wstr[i];
+    if (ch < '0' || ch > '9') continue;
+    int d = ch - '0';
+    if (melodyNotes.length() > 0) melodyNotes += ", ";
+    melodyNotes += noteMap[d];
+  }
+  if (melodyNotes.length() == 0) {
+    Serial.println("体重数字解析失败，无法生成主旋律提示");
+    return;
+  }
+
+  String prompt;
+  prompt += "身高：";
+  prompt += sg;
+  prompt += " 米，体重：";
+  prompt += weightStr;
+  prompt += " 千克；BMI = ";
+  prompt += String(bmi, 2);
+  prompt += "，体型为";
+  prompt += bmi_label_cn;
+  prompt += "（推荐风格关键词：";
+  prompt += style_text;
+  prompt += "）。主旋律音符序列为：";
+  prompt += melodyNotes;
+  prompt += "。请根据上述信息，为他生成一小段旋律，节奏和风格要符合体型特点。";
+  prompt += "只允许使用音名集合 {C4,D4,E4,F4,G4,A4,B4,C5,D5,REST}，";
+  prompt += "并严格按 system 提示要求的『音名/时值』格式输出，一行即可，"
+            "尽量生成 18~24 个音符，不要解释。";
+
+  client.publish(topic_text.c_str(), "已读取身高和体重，正在向 DeepSeek 请求旋律数据…");
+
+  String aiText = callDeepSeekChat(prompt);
+  client.publish(topic_text.c_str(), aiText.c_str());
+
+  if (aiText.startsWith("【错误】")) {
+    Serial.println("DeepSeek 调用失败，不打印网格。");
+    return;
+  }
+
+  digitalWrite(PIN_VHCTL, HIGH);
+  delay(80);
+
+  printMelodyFromString(aiText);
+
+  digitalWrite(PIN_VHCTL, LOW);
+  motor_stop();
+}
+
+// ================== 按键检测（可选） ==================
+bool key_pressed_edge(){
+  bool now = (digitalRead(PIN_KEY) == LOW);
+  bool edge = (!key_last && now);
+  key_last = now;
+  return edge;
+}
+
+// ================== setup / loop ==================
+void setup(){
+  Serial.begin(115200);
+  delay(1000);
+
+  topic_keyboard1 = String(mqtt_username) + "/" + project + "/" + "keyboard1";
+  topic_text      = String(mqtt_username) + "/" + project + "/" + "text";
+
+  pinMode(PIN_KEY, INPUT_PULLUP);
+
+  motor_init();
+  printer_init();
+
+  // WS2812 初始化
+  ringInner.begin();
+  ringMiddle.begin();
+  ringOuter.begin();
+  clearRing(ringInner);
+  clearRing(ringMiddle);
+  clearRing(ringOuter);
+  ringInner.show();
+  ringMiddle.show();
+  ringOuter.show();
+  wavePhaseStartMs = millis(); // 初始化水波纹动画时间基准
+  g_waveWeightLocked = false;
+
+  connectWiFi();
+  secureClient.setInsecure();  // 不校验证书（简单粗暴）
+  connectMQTT();
+
+  sg = "";
+
+  // ===== HX711 初始化 =====
+  Serial.println("初始化 HX711 ...");
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(1.0);
+
+  unsigned long t0 = millis();
+  while (!scale.is_ready() && millis() - t0 < 3000) {
+    delay(10);
+  }
+
+  if (!scale.is_ready()) {
+    Serial.println("HX711 一直未就绪，请检查接线/电源！");
+    scale_ok = false;
+  } else {
+    Serial.println("正在去皮，请确保秤上空载...");
+    scale.tare(20);      // 读 20 次平均作为零点
+    scale.set_scale(CALIBRATION_FACTOR);
+    Serial.println("HX711 去皮完成！");
+    scale_ok = true;
+  }
+}
+
+void loop(){
+  if (!client.connected()) {
+    connectMQTT();
+  }
+  client.loop();
+
+  // ===== 更新水波纹灯效（非阻塞，一轮内只用同一次体重）=====
+  updateWaterRipple();
+
+  // ===== MQTT：只关心身高输入 =====
+  if (mqtt_status) {
+    mqtt_status = false;
+
+    if (mqtt_topic == topic_keyboard1) {
+      sg = mqtt_data;
+      Serial.print("收到身高: ");
+      Serial.println(sg);
+      // 收到身高后，用当前秤上的体重直接生成 & 打印
+      maybeCallAI();
+    }
+  }
+
+  // 可选：按键触发一次，根据当前身高 + 当前体重手动打印
+  /*
+  if (key_pressed_edge()) {
+    Serial.println("按键触发 BMI 作曲打印...");
+    maybeCallAI();
+  }
+  */
+
+  delay(5);
+}
