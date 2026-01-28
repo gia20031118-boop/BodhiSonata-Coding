@@ -68,7 +68,7 @@ uint8_t MOTOR_TABLE[8][4] = {
 
 uint8_t motor_pos = 0;
 
-// 按键（可选）
+
 #define PIN_KEY   0
 bool key_last = true;
 
@@ -77,7 +77,7 @@ WiFiClient       espClient;
 PubSubClient     client(espClient);
 WiFiClientSecure secureClient;
 
-String sg;          // 身高（通过 MQTT 输入）
+String sg;         
 String mqtt_topic;
 String mqtt_data;
 bool   mqtt_status = false;
@@ -98,10 +98,10 @@ const char* noteMap[10] = {
 HX711 scale;
 bool  scale_ok = false;
 
-// 当前体重（给灯环用），默认 60kg
+
 float g_currentWeightKg = 60.0f;
 
-// 本“三圈循环”是否已经锁定过体重（控制灯速）
+
 bool g_waveWeightLocked = false;
 
 // ================== 7. WS2812 三圈灯环 ==================
@@ -146,7 +146,7 @@ void lockWeightForWave() {
   }
 }
 
-// 不带 show() 的版本：只改缓冲区
+
 void clearRing(Adafruit_NeoPixel &ring) {
   for (int i = 0; i < NUM_LEDS; i++) {
     ring.setPixelColor(i, 0, 0, 0);
